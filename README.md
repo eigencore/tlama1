@@ -54,7 +54,10 @@ Tlama-1 is a project developed by:
 
 ## Contact  
 
-If you have questions, suggestions, or would like to collaborate, feel free to reach out to us via [email or social media link].  
+If you have questions, suggestions, or would like to collaborate, feel free to reach out to us via email or social media:
+
+- **EigenCore**: https://eigencore.org/contact
+- **GIL - UNAM**: pending
 
 ---
 
