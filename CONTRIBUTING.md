@@ -36,7 +36,7 @@ git checkout -b feature/<your-feature-name> develop
 ---
 
 ### ✏️ **3️⃣ Make Your Changes**  
-- Follow the [Style Guide](style-guide.md) to ensure consistency.  
+- Follow the [Style Guide](https://eigen-core.gitbook.io/tlama-core-docs/contributing/style-guide) to ensure consistency.  
 - If adding new features, update the documentation accordingly.  
 - For reusable components (e.g., training utilities, kernels), consider contributing to **[tlama-core](https://github.com/eigencore/tlama-core)** instead.  
 
@@ -131,7 +131,8 @@ Provide steps for testing the changes.
 ## Related Issues  
 Link to any related issues (e.g., Fixes #123)  
 
-## Checklist    
+## Checklist  
+- [ ] I have followed the Style Guide.  
 - [ ] My code passes all tests.  
 - [ ] I have updated the documentation where needed.  
 - [ ] I have added tests for new features/changes (if applicable).  
