@@ -6,6 +6,19 @@ __pycache__/
 # C extensions
 *.so
 
+# Notebook metadata
+.ipynb_checkpoints
+
+# Notebooks
+*.ipynb
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+
 # Distribution / packaging
 .Python
 build/
