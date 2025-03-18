@@ -207,6 +207,28 @@ def repeat_kv(kv: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 class Attention(nn.Module):
+    """
+    Attention mechanism for the Tlama model.
+
+    This class implements the multi-head attention mechanism with rotary positional embeddings (RoPE)
+    and key-value caching for efficient transformer computations.
+
+    Attributes:
+        n_kv_heads (int): Number of key-value heads for attention.
+        n_local_heads (int): Number of local heads for model parallelism.
+        n_local_kv_heads (int): Number of local key-value heads for model parallelism.
+        n_rep (int): Number of repetitions for key-value heads.
+        head_dim (int): Dimensionality of each attention head.
+        Wq (ColumnParallelLinear): Linear layer for query projection.
+        Wk (ColumnParallelLinear): Linear layer for key projection.
+        Wv (ColumnParallelLinear): Linear layer for value projection.
+        Wo (RowParallelLinear): Linear layer for output projection.
+        cache_k (torch.Tensor): Cache for key tensors.
+        cache_v (torch.Tensor): Cache for value tensors.
+
+    Parameters:
+        config (TlamaConfig): Configuration object containing model hyperparameters.
+    """
     def __init__(self, config: TlamaConfig):
         super().__init__()
         self.n_kv_heads = config.n_kv_heads or config.n_heads 
@@ -273,6 +295,17 @@ class Attention(nn.Module):
         freq_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
     ):
+        """
+        Forward pass for the attention mechanism.
+        
+        Args:
+            x (torch.Tensor): Input tensor of shape `(batch_size, seq_len, d_model)`.
+            start_pos (int): Starting position for the sequence.
+            freq_cis (torch.Tensor): Complex-valued rotary positional embeddings.
+            mask (Optional[torch.Tensor]): Attention mask tensor.
+        Returns:
+            torch.Tensor: Output tensor after applying attention.
+        """
         
         bsz, seq_len, _ = x.shape
         # Project the embeddings to query, key, and value
@@ -334,6 +367,23 @@ class Attention(nn.Module):
     
     
 class FeedForward(nn.Module):
+    """
+    FeedForward network for the Tlama model.
+
+    This class implements a feed-forward neural network with optional dimensionality adjustments
+    and model parallelism. It uses the SwiGLU activation function for improved performance.
+
+    Attributes:
+        w1 (ColumnParallelLinear): First linear layer for the feed-forward network.
+        w2 (RowParallelLinear): Second linear layer for the feed-forward network.
+        w3 (ColumnParallelLinear): Third linear layer for the feed-forward network.
+
+    Parameters:
+        d_model (int): Dimensionality of the model.
+        hidden_dim (int): Dimensionality of the hidden layer.
+        multiple_of (int): Ensures the hidden layer size is a multiple of this value.
+        ffn_dim_multiplier (Optional[float]): Multiplier for feed-forward network dimension.
+    """
     def __init__(
         self,
         d_model: int,
@@ -376,9 +426,39 @@ class FeedForward(nn.Module):
         )
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass for the feed-forward network.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, d_model).
+
+        Returns:
+            torch.Tensor: Output tensor after applying the feed-forward network.
+        """
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
     
 class TransformerBlock():
+    """
+    Transformer block for the Tlama model.
+
+    This class implements a single transformer block, which consists of an attention mechanism
+    followed by a feed-forward neural network. Each block also includes layer normalization
+    before the attention and feed-forward layers.
+
+    Attributes:
+        n_heads (int): Number of attention heads.
+        d_model (int): Dimensionality of the model.
+        head_dim (int): Dimensionality of each attention head.
+        attention (Attention): Attention mechanism for the transformer block.
+        ffn (FeedForward): Feed-forward neural network for the transformer block.
+        layer_id (int): Identifier for the layer.
+        attention_norm (RMSNorm): Layer normalization before the attention mechanism.
+        ffn_norm (RMSNorm): Layer normalization before the feed-forward network.
+
+    Parameters:
+        layer_id (int): Identifier for the layer.
+        config (TlamaConfig): Configuration object containing model hyperparameters.
+    """
     def __init__(self, layer_id: int, config: TlamaConfig):
         super().__init__()
         self.n_heads = config.n_heads
@@ -403,11 +483,43 @@ class TransformerBlock():
         freq_cis: torch.Tensor,
         mask: Optional[torch.Tensor]
     ):
+        """
+        Forward pass for the transformer block.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, d_model).
+            start_pos (int): Starting position for the sequence.
+            freq_cis (torch.Tensor): Complex-valued rotary positional embeddings.
+            mask (Optional[torch.Tensor]): Attention mask tensor.
+
+        Returns:
+            torch.Tensor: Output tensor after applying the transformer block.
+        """
         h = x + self.attention(self.attention_norm(x), start_pos, freq_cis, mask)
         out = h + self.ffn(self.ffn_norm(h))
         return out
     
 class Transformer(nn.Module):
+    """
+    Transformer model for the Tlama model.
+
+    This class implements the full transformer model, which consists of an embedding layer,
+    multiple transformer blocks, and a final linear layer for output. The model also includes
+    rotary positional embeddings (RoPE) and layer normalization.
+
+    Attributes:
+        config (TlamaConfig): Configuration object containing model hyperparameters.
+        vocab_size (int): Size of the vocabulary.
+        n_layers (int): Number of transformer layers.
+        token_emb (VocabParallelEmbedding): Embedding layer for input tokens.
+        layers (nn.ModuleList): List of transformer blocks.
+        norm (RMSNorm): Layer normalization applied to the final output.
+        output (ColumnParallelLinear): Linear layer for generating the final output.
+        freq_cis (torch.Tensor): Complex-valued rotary positional embeddings.
+
+    Parameters:
+        config (TlamaConfig): Configuration object containing model hyperparameters.
+    """
     def __init__(self, config: TlamaConfig):
         super().__init__()
         self.config = config
@@ -446,6 +558,16 @@ class Transformer(nn.Module):
         tokens: torch.Tensor,
         start_pos: int,
     ):
+        """
+        Forward pass for the transformer model.
+
+        Args:
+            tokens (torch.Tensor): Input tensor of shape (batch_size, seq_len) containing token indices.
+            start_pos (int): Starting position for the sequence.
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, seq_len, vocab_size) containing the model's predictions.
+        """
         _bsz, seq_len = tokens.shape
         h = self.token_emb(tokens)
         self.freq_cis = self.freq_cis.to(h.device)
