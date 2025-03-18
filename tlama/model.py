@@ -12,11 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
+import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from dataclasses import dataclass
 from typing import Optional, Tuple
+import fairscale.nn.model_parallel.initialize as fs_init
+from fairscale.nn.model_parallel.layers import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+    VocabParallelEmbedding,
+)
 
 
 @dataclass
@@ -40,6 +47,7 @@ class TlamaConfig:
     """
     d_model: int = 4096
     n_layers: int = 32
+    n_heads: int = 32
     n_kv_heads: Optional[int] = None
     vocab_size: int = -1
     multiple_of: int = 256  # Ensures hidden layer size in SwiGLU is a multiple of this value
@@ -187,4 +195,127 @@ def apply_rope(
     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
+def repeat_kv(kv: torch.Tensor, n_rep: int) -> torch.Tensor:
+    bsz, seq_len, n_kv_heads, head_dim = kv.shape
+    if n_rep == 1:
+        return kv
+    return (
+        kv[:, :, :, None, :]
+        .expand(bsz, seq_len, n_kv_heads, n_rep, head_dim)
+        .reshape(bsz, seq_len, n_kv_heads * n_rep, head_dim)
+    )
 
+
+class Attention(nn.Module):
+    def __init__(self, config: TlamaConfig):
+        super.__init__()
+        self.n_kv_heads = config.n_kv_heads or config.n_heads 
+        model_parallel_size = fs_init.get_model_parallel_world_size() # number of model parallel GPUs
+        self.n_local_heads = config.n_heads // model_parallel_size
+        self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
+        self.n_rep = self.n_local_heads // self.n_local_kv_heads
+        self.head_dim = config.d_model // config.n_heads
+        
+        self.Wq = ColumnParallelLinear( # This creates the Wq (query) matrix of shape (d_model, n_heads * head_dim). It is similar to nn.Linear but with model parallelism.
+            config.d_model,
+            config.n_heads * self.head_dim,
+            bias=False,
+            gather_output=False,
+            init_method=lambda x: x # TODO: Create a smart initializer method
+        )
+        
+        self.Wk = ColumnParallelLinear(
+            config.d_model,
+            config.n_heads * self.head_dim,
+            bias=False,
+            gather_output=False,
+            init_method=lambda x: x # TODO: Create a smart initializer method
+        )
+        
+        self.Wv = ColumnParallelLinear(
+            config.d_model,
+            config.n_heads * self.head_dim,
+            bias=False,
+            gather_output=False,
+            init_method=lambda x: x # TODO: Create a smart initializer method
+        )
+        
+        self.Wo = RowParallelLinear(
+            config.n_heads * self.head_dim,
+            config.d_model,
+            input_is_parallel=True,
+            bias=False,
+            init_method=lambda x: x # TODO: Create a smart initializer method
+        )
+        
+        self.cache_k = torch.zeros(
+            (
+                config.max_batch_size,
+                config.max_seq_len,
+                self.n_local_kv_heads,
+                self.head_dim
+            )
+        ).cuda()
+        
+        self.cache_v = torch.zeros(
+            (
+                config.max_batch_size,
+                config.max_seq_len,
+                self.n_local_kv_heads,
+                self.head_dim
+            )
+        ).cuda()
+        
+    def forward(
+        self,
+        x: torch.Tensor,
+        start_pos: int,
+        freq_cis: torch.Tensor,
+        mask: Optional[torch.Tensor],
+    ):
+        
+        bsz, seq_len, _ = x.shape
+        # Project the embeddings to query, key, and value
+        xq, xk, xv = self.Wq(x), self.Wk(x), self.Wv(x)
+        
+        xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
+        xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+        
+        xq, xk = apply_rope(xq, xk, freq_cis)
+        
+        self.cache_k = self.cache_k.to(xq)
+        self.cache_v = self.cache_v.to(xq)
+        
+        self.cache_k[:bsz, start_pos : start_pos + seq_len] = xk
+        self.cache_v[:bsz, start_pos : start_pos + seq_len] = xv
+        
+        keys = self.cache_k[:bsz, : start_pos + seq_len]
+        values = self.cache_v[:bsz, : start_pos + seq_len]
+        
+        # if n_kv_heads < n_heads, we need to replicate the keys and values
+        keys = repeat_kv(
+            keys,
+            self.n_rep
+        ) # shape: (bsz, chahe_len + seq_len, n_local_heads, head_dim)
+        values = repeat_kv(
+            values,
+            self.n_rep
+        ) # shape: (bsz, cache_len + seq_len, n_local_heads, head_dim)
+        
+        xq = xq.transpose(1,2) # (bsz, n_local_heads, seq_len, head_dim)
+        keys = keys.transpose(1,2) # (bsz, n_local_heads, cache_len + seq_len, head_dim)
+        values = values.transpose(1,2) # (bsz, n_local_heads, cache_len + seq_len, head_dim)
+        
+        scores = torch.matmul(xq, keys.transpose(2,3)) / math.sqrt(self.head_dim) 
+        
+        if mask is not None:
+            scores = scores + mask
+            
+        scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+        output = torch.matmul(scores, values)
+        output = output.transpose(1,2).contiguous().view(bsz, seq_len, -1)
+        return self.Wo(output)
+    
+    
+    
