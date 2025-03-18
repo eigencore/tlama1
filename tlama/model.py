@@ -208,7 +208,7 @@ def repeat_kv(kv: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 class Attention(nn.Module):
     def __init__(self, config: TlamaConfig):
-        super.__init__()
+        super().__init__()
         self.n_kv_heads = config.n_kv_heads or config.n_heads 
         model_parallel_size = fs_init.get_model_parallel_world_size() # number of model parallel GPUs
         self.n_local_heads = config.n_heads // model_parallel_size
@@ -307,6 +307,9 @@ class Attention(nn.Module):
         keys = keys.transpose(1,2) # (bsz, n_local_heads, cache_len + seq_len, head_dim)
         values = values.transpose(1,2) # (bsz, n_local_heads, cache_len + seq_len, head_dim)
         
+        
+        # ---------------------------- Manual attention ------------------------------
+        
         scores = torch.matmul(xq, keys.transpose(2,3)) / math.sqrt(self.head_dim) 
         
         if mask is not None:
@@ -314,8 +317,164 @@ class Attention(nn.Module):
             
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
         output = torch.matmul(scores, values)
+        # ----------------------------------------------------------------------------
+        
+        # NOTE: Needs to evaluate if we can change the manual implementation for F.scaled_dot_product_attention()
+        # along with fairscale implementation
+        # Use scaled_dot_product_attention
+        # output = F.scaled_dot_product_attention(
+        #    xq, keys, values,
+        #    attn_mask=mask,  # Pass the mask if provided
+        #    is_causal=mask is None  # Use causal attention if no mask is provided
+        #) 
+        
+        
         output = output.transpose(1,2).contiguous().view(bsz, seq_len, -1)
         return self.Wo(output)
+    
+    
+class FeedForward(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        hidden_dim: int,
+        multiple_of: int,
+        ffn_dim_multiplier: Optional[float]
+    ):
+        
+        super().__init__()
+        if ffn_dim_multiplier is not None:
+            hidden_dim = int(hidden_dim * ffn_dim_multiplier)
+        else:
+            hidden_dim = int(2 * hidden_dim / 3)
+
+        hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
+        
+        
+        self.w1 = ColumnParallelLinear(
+            d_model,
+            hidden_dim,
+            bias=False,
+            gather_output=False,
+            init_method=lambda x: x
+        )
+        
+        self.w2 = RowParallelLinear(
+            hidden_dim,
+            d_model,
+            bias=False,
+            input_is_parallel=True,
+            init_method=lambda x: x
+        )
+        
+        self.w3 = ColumnParallelLinear(
+            d_model,
+            hidden_dim,
+            bias=False,
+            gather_output=False,
+            init_method=lambda x: x
+        )
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+    
+class TransformerBlock():
+    def __init__(self, layer_id: int, config: TlamaConfig):
+        super().__init__()
+        self.n_heads = config.n_heads
+        self.d_model = config.d_model
+        self.head_dim = config.d_model // config.n_heads
+        self.attention = Attention(config)
+        self.ffn = FeedForward(
+            d_model=config.d_model,
+            hidden_dim=4*config.d_model,
+            multiple_of=config.multiple_of,
+            ffn_dim_multiplier=config.ffn_dim_multiplier
+        )
+        self.layer_id = layer_id
+        self.attention_norm = RMSNorm(config.d_model, eps=config.norm_eps)
+        self.ffn_norm = RMSNorm(config.d_model, eps=config.norm_eps)
+        
+    
+    def forward(
+        self,
+        x: torch.Tensor,
+        start_pos: int,
+        freq_cis: torch.Tensor,
+        mask: Optional[torch.Tensor]
+    ):
+        h = x + self.attention(self.attention_norm(x), start_pos, freq_cis, mask)
+        out = h + self.ffn(self.ffn_norm(h))
+        return out
+    
+class Transformer(nn.Module):
+    def __init__(self, config: TlamaConfig):
+        super().__init__()
+        self.config = config
+        self.vocab_size = config.vocab_size
+        self.n_layers = config.n_layers
+        
+        self.token_emb = VocabParallelEmbedding(
+            self.vocab_size,
+            config.d_model,
+            init_method=lambda x: x
+        )
+        
+        self.layers = nn.ModuleList()
+        for layer_id in range(self.n_layers):
+            self.layers.append(TransformerBlock(layer_id, config))
+            
+        self.norm = RMSNorm(config.d_model, eps=config.norm_eps)
+        
+        self.output = ColumnParallelLinear(
+            config.d_model,
+            self.vocab_size,
+            bias=False,
+            init_method=lambda x: x
+        )
+        
+        self.freq_cis = compute_freqs_cis(
+            config.d_model,
+            config.max_seq_len * 2,
+            config.rope_theta
+        )
+        
+        
+    @torch.inference_mode()
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        start_pos: int,
+    ):
+        _bsz, seq_len = tokens.shape
+        h = self.token_emb(tokens)
+        self.freq_cis = self.freq_cis.to(h.device)
+        freq_cis = self.freq_cis[start_pos : start_pos + seq_len]
+        
+        mask = None
+        if seq_len > 1:
+            mask = torch.full((seq_len, seq_len), float('-inf'), device=tokens.device)
+            
+            mask = torch.triu(mask, diagonal=1)
+            
+            # When performing key-value caching, we compute the attention scores
+            # only for the new sequence. Thus, the matrix of scores is of size 
+            # (seq_len, cache_len + seq_len) and the only masked entries are (i, j)
+            # for j > cache_len + i, since row i corresponds to the token cache_len + i.
+            mask =  torch.hstack(
+                [torch.zeros((seq_len, start_pos), device=tokens.device), mask]
+            ).type_as(h)
+            
+            
+        for layer in self.layers:
+            h = layer(h, start_pos, freq_cis, mask)
+        h = self.norm(h)
+        output = self.output(h).float()
+        return output
+            
+
+        
+        
     
     
     
