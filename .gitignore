@@ -12,6 +12,12 @@ __pycache__/
 # Notebooks
 *.ipynb
 
+
+# -------------------------------
+train.py
+bench/
+edu_fineweb10B/
+
 # Environments
 .env
 .venv
