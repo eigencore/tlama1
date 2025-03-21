@@ -57,8 +57,6 @@ class TlamaConfig:
     
     max_batch_size: int = 32
     max_seq_len: int = 2048
-    
-    parallel: bool = True
 
     
 
@@ -127,7 +125,7 @@ def compute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
                       position and frequency.
     """
     theta_ = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
-    m = torch.arange(end, device=theta_.device, dtype=torch.float32)
+    m = torch.arange(end, device=freqs.device, dtype=torch.float32)
     freqs = torch.outer(m, theta_)  # m_i * theta_j
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # r*(cos(m_i * theta_j), sin(m_i * theta_j)), r=1
     return freqs_cis
@@ -166,16 +164,6 @@ def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
     shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
     return freqs_cis.view(*shape)
 
-
-
-def _init_weights(x: torch.Tensor, module: str, config: TlamaConfig):
-    std = 0.02
-    if module == 'embedding':
-        torch.nn.init.normal_(x, mean=0.0, std=std)
-    else:
-        std *= (2 * config.n_layers) ** -0.5
-        torch.nn.init.normal_(x, mean=0.0, std=std)
-        
 
 def apply_rope(
     xq: torch.Tensor,
@@ -243,55 +231,44 @@ class Attention(nn.Module):
     """
     def __init__(self, config: TlamaConfig):
         super().__init__()
-        self.n_kv_heads = config.n_kv_heads or config.n_heads
-        model_parallel_size = fs_init.get_model_parallel_world_size() if config.parallel else 1
+        self.n_kv_heads = config.n_kv_heads or config.n_heads 
+        model_parallel_size = fs_init.get_model_parallel_world_size() # number of model parallel GPUs
         self.n_local_heads = config.n_heads // model_parallel_size
         self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = config.d_model // config.n_heads
         
-        if config.parallel:
-            self.Wq = ColumnParallelLinear( # This creates the Wq (query) matrix of shape (d_model, n_heads * head_dim). It is similar to nn.Linear but with model parallelism.
-                config.d_model,
-                config.n_heads * self.head_dim,
-                bias=False,
-                gather_output=False,
-                init_method= lambda x: _init_weights(x, 'linear', config)
-            )
-            
-            self.Wk = ColumnParallelLinear(
-                config.d_model,
-                config.n_heads * self.head_dim,
-                bias=False,
-                gather_output=False,
-                init_method=lambda x: _init_weights(x, 'linear', config)
-            )
-            
-            self.Wv = ColumnParallelLinear(
-                config.d_model,
-                config.n_heads * self.head_dim,
-                bias=False,
-                gather_output=False,
-                init_method=lambda x: _init_weights(x, 'linear', config)
-            )
-            
-            self.Wo = RowParallelLinear(
-                config.n_heads * self.head_dim,
-                config.d_model,
-                input_is_parallel=True,
-                bias=False,
-                init_method=lambda x: _init_weights(x, 'linear', config)
-            )
-        else:
-            self.Wq = nn.Linear(config.d_model, config.n_heads * self.head_dim, bias=False)
-            self.Wk = nn.Linear(config.d_model, config.n_heads * self.head_dim, bias=False)
-            self.Wv = nn.Linear(config.d_model, config.n_heads * self.head_dim, bias=False)
-            self.Wo = nn.Linear(config.n_heads * self.head_dim, config.d_model, bias=False)
-            _init_weights(self.Wq.weight, 'linear', config)
-            _init_weights(self.Wk.weight, 'linear', config)
-            _init_weights(self.Wv.weight, 'linear', config)
-            _init_weights(self.Wo.weight, 'linear', config)
-            
+        self.Wq = ColumnParallelLinear( # This creates the Wq (query) matrix of shape (d_model, n_heads * head_dim). It is similar to nn.Linear but with model parallelism.
+            config.d_model,
+            config.n_heads * self.head_dim,
+            bias=False,
+            gather_output=False,
+            init_method=lambda x: x # TODO: Create a smart initializer method
+        )
+        
+        self.Wk = ColumnParallelLinear(
+            config.d_model,
+            config.n_heads * self.head_dim,
+            bias=False,
+            gather_output=False,
+            init_method=lambda x: x # TODO: Create a smart initializer method
+        )
+        
+        self.Wv = ColumnParallelLinear(
+            config.d_model,
+            config.n_heads * self.head_dim,
+            bias=False,
+            gather_output=False,
+            init_method=lambda x: x # TODO: Create a smart initializer method
+        )
+        
+        self.Wo = RowParallelLinear(
+            config.n_heads * self.head_dim,
+            config.d_model,
+            input_is_parallel=True,
+            bias=False,
+            init_method=lambda x: x # TODO: Create a smart initializer method
+        )
         
         self.cache_k = torch.zeros(
             (
@@ -412,7 +389,6 @@ class FeedForward(nn.Module):
         d_model: int,
         hidden_dim: int,
         multiple_of: int,
-        config: TlamaConfig,
         ffn_dim_multiplier: Optional[float]
     ):
         
@@ -424,38 +400,30 @@ class FeedForward(nn.Module):
 
         hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
         
-        if config.parallel:
-            self.w1 = ColumnParallelLinear(
-                d_model,
-                hidden_dim,
-                bias=False,
-                gather_output=False,
-                init_method=lambda x: _init_weights(x, 'linear', config)
-            )
-            
-            self.w2 = RowParallelLinear(
-                hidden_dim,
-                d_model,
-                bias=False,
-                input_is_parallel=True,
-                init_method=lambda x: _init_weights(x, 'linear', config)
-            )
-            
-            self.w3 = ColumnParallelLinear(
-                d_model,
-                hidden_dim,
-                bias=False,
-                gather_output=False,
-                init_method=lambda x: _init_weights(x, 'linear', config)
-            )
-        else:
-            self.w1 = nn.Linear(d_model, hidden_dim, bias=False)
-            self.w2 = nn.Linear(hidden_dim, d_model, bias=False)
-            self.w3 = nn.Linear(d_model, hidden_dim, bias=False)
-            _init_weights(self.w1.weight, 'linear', config)
-            _init_weights(self.w2.weight, 'linear', config)
-            _init_weights(self.w3.weight, 'linear', config)
-            
+        
+        self.w1 = ColumnParallelLinear(
+            d_model,
+            hidden_dim,
+            bias=False,
+            gather_output=False,
+            init_method=lambda x: x
+        )
+        
+        self.w2 = RowParallelLinear(
+            hidden_dim,
+            d_model,
+            bias=False,
+            input_is_parallel=True,
+            init_method=lambda x: x
+        )
+        
+        self.w3 = ColumnParallelLinear(
+            d_model,
+            hidden_dim,
+            bias=False,
+            gather_output=False,
+            init_method=lambda x: x
+        )
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -469,7 +437,7 @@ class FeedForward(nn.Module):
         """
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
     
-class TransformerBlock(nn.Module):
+class TransformerBlock():
     """
     Transformer block for the Tlama model.
 
@@ -501,7 +469,6 @@ class TransformerBlock(nn.Module):
             d_model=config.d_model,
             hidden_dim=4*config.d_model,
             multiple_of=config.multiple_of,
-            config=config, # TODO: Make this more elegant
             ffn_dim_multiplier=config.ffn_dim_multiplier
         )
         self.layer_id = layer_id
@@ -559,7 +526,11 @@ class Transformer(nn.Module):
         self.vocab_size = config.vocab_size
         self.n_layers = config.n_layers
         
-
+        self.token_emb = VocabParallelEmbedding(
+            self.vocab_size,
+            config.d_model,
+            init_method=lambda x: x
+        )
         
         self.layers = nn.ModuleList()
         for layer_id in range(self.n_layers):
@@ -567,43 +538,18 @@ class Transformer(nn.Module):
             
         self.norm = RMSNorm(config.d_model, eps=config.norm_eps)
         
-        if config.parallel:
-            self.output = ColumnParallelLinear(
-                config.d_model,
-                self.vocab_size,
-                bias=False,
-                init_method=lambda x: _init_weights(x, 'linear', config)
-            )
-            
-            self.token_emb = VocabParallelEmbedding(
-                self.vocab_size,
-                config.d_model,
-                init_method= lambda x: _init_weights(x, 'embedding', config)
-            )
-        else:
-            self.output = nn.Linear(config.d_model, self.vocab_size, bias=False)
-            self.token_emb = nn.Embedding(self.vocab_size, config.d_model)
-            _init_weights(self.token_emb.weight, 'embedding', config)
-        
-        self.register_buffer(
-            "freq_cis",
-            compute_freqs_cis(
-                config.d_model // config.n_heads,  # head_dim
-                config.max_seq_len * 2,
-                config.rope_theta
-            )
+        self.output = ColumnParallelLinear(
+            config.d_model,
+            self.vocab_size,
+            bias=False,
+            init_method=lambda x: x
         )
         
-    def configure_optimizers(self, weight_decay, learning_rate, device_type, master_process=True):
-        param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-        optim_groups = [
-            {'params': decay_params, 'weight_decay': weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0}
-        ]
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8)
-        return optimizer
+        self.freq_cis = compute_freqs_cis(
+            config.d_model,
+            config.max_seq_len * 2,
+            config.rope_theta
+        )
         
         
     @torch.inference_mode()
@@ -647,3 +593,10 @@ class Transformer(nn.Module):
         h = self.norm(h)
         output = self.output(h).float()
         return output
+            
+
+        
+        
+    
+    
+    
