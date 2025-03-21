@@ -6,6 +6,16 @@ __pycache__/
 # C extensions
 *.so
 
+
+#------------------------------
+# Train
+train.py
+
+# Data
+edu_fineweb*/
+
+bench/
+#-------------------------------
 # Notebook metadata
 .ipynb_checkpoints
 
