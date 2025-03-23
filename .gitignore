@@ -9,7 +9,7 @@ __pycache__/
 
 #------------------------------
 # Train
-train.py
+#train.py
 
 # Data
 edu_fineweb*/
