@@ -158,7 +158,6 @@ def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
         torch.Size([1, 2048, 256])
     """
     ndim = x.ndim
-    print(x.shape)
     assert 0 <= 1 < ndim, "Input tensor `x` must have at least 2 dimensions."
     assert freqs_cis.shape == (x.shape[1], x.shape[-1]), (
         "Shape of `freqs_cis` must match the sequence length and embedding size of `x`."
@@ -167,14 +166,6 @@ def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
     return freqs_cis.view(*shape)
 
 
-
-def _init_weights(x: torch.Tensor, module: str, config: TlamaConfig):
-    std = 0.02
-    if module == 'embedding':
-        torch.nn.init.normal_(x, mean=0.0, std=std)
-    else:
-        std *= (2 * config.n_layers) ** -0.5
-        torch.nn.init.normal_(x, mean=0.0, std=std)
         
 
 def apply_rope(
@@ -256,12 +247,13 @@ class Attention(nn.Module):
         self.Wk = nn.Linear(config.d_model, config.n_heads * self.head_dim, bias=False)
         self.Wv = nn.Linear(config.d_model, config.n_heads * self.head_dim, bias=False)
         self.Wo = nn.Linear(config.n_heads * self.head_dim, config.d_model, bias=False)
+        
+        self.Wo.TLAMA124M_SCALE_INIT = 1
 
             
     def forward(
         self,
         x: torch.Tensor,
-        start_pos: int,
         freq_cis: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
     ):
@@ -287,18 +279,13 @@ class Attention(nn.Module):
         
         xq, xk = apply_rope(xq, xk, freq_cis)
         
-
         keys = xk
         values = xv
-            
                 
         xq = xq.transpose(1,2) 
         keys = keys.transpose(1,2) 
         values = values.transpose(1,2)
         
-        
- 
-
         output = F.scaled_dot_product_attention(
         xq, keys, values,
         is_causal=True  # Use causal attention if no mask is provided
@@ -317,9 +304,9 @@ class FeedForward(nn.Module):
     and model parallelism. It uses the SwiGLU activation function for improved performance.
 
     Attributes:
-        w1 (ColumnParallelLinear): First linear layer for the feed-forward network.
-        w2 (RowParallelLinear): Second linear layer for the feed-forward network.
-        w3 (ColumnParallelLinear): Third linear layer for the feed-forward network.
+        w1: First linear layer for the feed-forward network.
+        w2: Second linear layer for the feed-forward network.
+        w3: Third linear layer for the feed-forward network.
 
     Parameters:
         d_model (int): Dimensionality of the model.
@@ -332,7 +319,6 @@ class FeedForward(nn.Module):
         d_model: int,
         hidden_dim: int,
         multiple_of: int,
-        config: TlamaConfig,
         ffn_dim_multiplier: Optional[float]
     ):
         
@@ -344,38 +330,13 @@ class FeedForward(nn.Module):
 
         hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
         
-        if config.use_parallel:
-            self.w1 = ColumnParallelLinear(
-                d_model,
-                hidden_dim,
-                bias=False,
-                gather_output=False,
-                init_method=lambda x: _init_weights(x, 'linear', config)
-            )
-            
-            self.w2 = RowParallelLinear(
-                hidden_dim,
-                d_model,
-                bias=False,
-                input_is_parallel=True,
-                init_method=lambda x: _init_weights(x, 'linear', config)
-            )
-            
-            self.w3 = ColumnParallelLinear(
-                d_model,
-                hidden_dim,
-                bias=False,
-                gather_output=False,
-                init_method=lambda x: _init_weights(x, 'linear', config)
-            )
-        else:
-            self.w1 = nn.Linear(d_model, hidden_dim, bias=False)
-            self.w2 = nn.Linear(hidden_dim, d_model, bias=False)
-            self.w3 = nn.Linear(d_model, hidden_dim, bias=False)
-            _init_weights(self.w1.weight, 'linear', config)
-            _init_weights(self.w2.weight, 'linear', config)
-            _init_weights(self.w3.weight, 'linear', config)
-            
+
+        self.w1 = nn.Linear(d_model, hidden_dim, bias=False)
+        self.w2 = nn.Linear(hidden_dim, d_model, bias=False)
+        self.w3 = nn.Linear(d_model, hidden_dim, bias=False)
+        
+        self.w2.TLAMA124M_SCALE_INIT = 1
+
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -421,7 +382,6 @@ class TransformerBlock(nn.Module):
             d_model=config.d_model,
             hidden_dim=4*config.d_model,
             multiple_of=config.multiple_of,
-            config=config, # TODO: Make this more elegant
             ffn_dim_multiplier=config.ffn_dim_multiplier
         )
         self.layer_id = layer_id
@@ -432,7 +392,6 @@ class TransformerBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        start_pos: int,
         freq_cis: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
     ):
@@ -448,7 +407,7 @@ class TransformerBlock(nn.Module):
         Returns:
             torch.Tensor: Output tensor after applying the transformer block.
         """
-        h = x + self.attention(self.attention_norm(x), start_pos, freq_cis, mask)
+        h = x + self.attention(self.attention_norm(x), freq_cis)
         out = h + self.ffn(self.ffn_norm(h))
         return out
     
@@ -478,32 +437,16 @@ class Transformer(nn.Module):
         self.config = config
         self.vocab_size = config.vocab_size
         self.n_layers = config.n_layers
-        
-
-        
+    
         self.layers = nn.ModuleList()
         for layer_id in range(self.n_layers):
             self.layers.append(TransformerBlock(layer_id, config))
             
         self.norm = RMSNorm(config.d_model, eps=config.norm_eps)
         
-        if config.use_parallel:
-            self.output = ColumnParallelLinear(
-                config.d_model,
-                self.vocab_size,
-                bias=False,
-                init_method=lambda x: _init_weights(x, 'linear', config)
-            )
-            
-            self.token_emb = VocabParallelEmbedding(
-                self.vocab_size,
-                config.d_model,
-                init_method= lambda x: _init_weights(x, 'embedding', config)
-            )
-        else:
-            self.output = nn.Linear(config.d_model, self.vocab_size, bias=False)
-            self.token_emb = nn.Embedding(self.vocab_size, config.d_model)
-            _init_weights(self.token_emb.weight, 'embedding', config)
+        self.output = nn.Linear(config.d_model, self.vocab_size, bias=False)
+        self.token_emb = nn.Embedding(self.vocab_size, config.d_model)
+        
         
         self.register_buffer(
             "freq_cis",
@@ -513,25 +456,26 @@ class Transformer(nn.Module):
                 config.rope_theta
             )
         )
+        
+        self.apply(self._init_weights)
+        
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, 'TLAMA124M_SCALE_INIT'):
+                std *= (2 * self.config.n_layers) ** -0.5
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-        
-    def configure_optimizers(self, weight_decay, learning_rate, device_type, master_process=True):
-        param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-        optim_groups = [
-            {'params': decay_params, 'weight_decay': weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0}
-        ]
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8)
-        return optimizer
-        
         
     #@torch.inference_mode()
     def forward(
         self,
         tokens: torch.Tensor,
-        start_pos: int,
+        targets: torch.Tensor = None,
     ):
         """
         Forward pass for the transformer model.
@@ -548,7 +492,23 @@ class Transformer(nn.Module):
                 
             
         for layer in self.layers:
-            h = layer(h, start_pos, self.freq_cis, mask)
+            h = layer(tok_emb, self.freq_cis)
         h = self.norm(h)
         output = self.output(h).float()
-        return output
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(output.view(-1, output.size(-1)), targets.view(-1))
+        return output, loss
+    
+    
+    
+    def configure_optimizers(self, weight_decay, learning_rate, device_type, master_process=True):
+        param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8)
+        return optimizer

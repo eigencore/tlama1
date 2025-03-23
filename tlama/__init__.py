@@ -1,1 +1,1 @@
-from .model import Transformer, TlamaConfig
+from .simple_model import Transformer, TlamaConfig
