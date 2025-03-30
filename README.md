@@ -1,5 +1,9 @@
 # Tlama-1  
 
+<div align="center">
+  <img src="https://i.postimg.cc/R00W9YMj/Tlama-1.png" alt="EigenCore" width="150" style="margin-right: 50px;">
+</div>
+
 Welcome to the **Tlama-1** repository! This project is a collaborative effort between the **EigenCore team** and the **Grupo de Ingeniería Lingüística (GIL)** at the **Universidad Nacional Autónoma de México (UNAM)** to develop an advanced language model that prioritizes Spanish, Indigenous languages of Mexico, and English.  
 
 Tlama-1 is based on the **LLAMA architecture** and is currently in the **development phase**, with pre-training underway. It will be released to the community soon.  
